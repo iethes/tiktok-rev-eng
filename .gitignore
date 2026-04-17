@@ -1,1 +1,10 @@
 /output/*
+
+.env
+
+/__pycache__
+
+/.venv/*
+
+/venv/*
+
