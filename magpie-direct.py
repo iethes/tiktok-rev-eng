@@ -33,6 +33,7 @@ import frida
 import pika
 from google.cloud import storage
 from dotenv import load_dotenv
+import captcha as captcha_mod
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
@@ -52,8 +53,9 @@ logging.getLogger("google.auth").setLevel(logging.WARNING)
 logging.getLogger("google.cloud").setLevel(logging.WARNING)
 logger = logging.getLogger("MagpieDirect")
 
-AGENT_PATH = SCRIPT_DIR / "_agent_rpc.js"
-CSV_PATH = SCRIPT_DIR / "products_tiktok.csv"
+AGENT_PATH         = SCRIPT_DIR / "_agent_rpc.js"
+CAPTCHA_AGENT_PATH = SCRIPT_DIR / "_agent_captcha.js"
+CSV_PATH           = SCRIPT_DIR / "products_tiktok.csv"
 
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
 MIN_RESPONSE_LEN = int(os.getenv("MIN_RESPONSE_LEN", "10000"))
@@ -74,7 +76,69 @@ GCS_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "gcs-service-accou
 ADB_DEVICE = os.getenv("ADB_DEVICE", "localhost:9102")
 FRIDA_SERVER_PATH = os.getenv("FRIDA_SERVER_PATH", "/data/local/tmp/frida-server-17.9.1")
 FRIDA_PORT = os.getenv("FRIDA_PORT", "27042")
-TIKTOK_PACKAGE = os.getenv("TIKTOK_PACKAGE", "com.zhiliaoapp.musically")
+TIKTOK_PACKAGE    = os.getenv("TIKTOK_PACKAGE", "com.zhiliaoapp.musically")
+CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
+
+BURST_PAUSE_MIN_REQUESTS = int(os.getenv("BURST_PAUSE_MIN_REQUESTS", "30"))
+BURST_PAUSE_MAX_REQUESTS = int(os.getenv("BURST_PAUSE_MAX_REQUESTS", "32"))
+BURST_PAUSE_MIN_SECONDS  = int(os.getenv("BURST_PAUSE_MIN_SECONDS", str(5 * 60)))
+BURST_PAUSE_MAX_SECONDS  = int(os.getenv("BURST_PAUSE_MAX_SECONDS", str(7 * 60)))
+SCREEN_WAKE_INTERVAL     = int(os.getenv("SCREEN_WAKE_INTERVAL", "45"))
+SWIPE_MIN_REQUESTS       = int(os.getenv("SWIPE_MIN_REQUESTS", "2"))
+SWIPE_MAX_REQUESTS       = int(os.getenv("SWIPE_MAX_REQUESTS", "5"))
+
+
+def stop_tiktok_app(device: str = ADB_DEVICE) -> None:
+    """Force-stop the TikTok app on the device."""
+    try:
+        subprocess.run(
+            ["adb", "-s", device, "shell", f"am force-stop {TIKTOK_PACKAGE}"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        logger.info(f"Stopped {TIKTOK_PACKAGE} on {device}")
+    except Exception as e:
+        logger.warning(f"stop_tiktok_app failed: {e}")
+
+
+def wake_device(device: str = ADB_DEVICE) -> None:
+    """Wake the screen (KEYCODE_WAKEUP) and swipe up to dismiss the lockscreen."""
+    try:
+        subprocess.run(
+            ["adb", "-s", device, "shell", "input keyevent KEYCODE_WAKEUP"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        time.sleep(0.3)
+        subprocess.run(
+            ["adb", "-s", device, "shell", "input swipe 500 1500 500 500 300"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+    except Exception as e:
+        logger.debug(f"wake_device failed: {e}")
+
+
+def swipe_screen_down(device: str = ADB_DEVICE) -> None:
+    """Simulate a swipe-up finger gesture (scrolls the view content down)."""
+    try:
+        subprocess.run(
+            ["adb", "-s", device, "shell", "input swipe 500 1500 500 500 300"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        logger.debug("Performed scroll-down (swipe-up) on %s", device)
+    except Exception as e:
+        logger.debug(f"swipe_screen_down failed: {e}")
+
+
+def start_tiktok_app(device: str = ADB_DEVICE, wait_secs: int = 5) -> None:
+    """Launch the TikTok app on the device and wait for it to come up."""
+    try:
+        subprocess.run(
+            ["adb", "-s", device, "shell", f"monkey -p {TIKTOK_PACKAGE} 1"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        logger.info(f"Started {TIKTOK_PACKAGE} on {device}, waiting {wait_secs}s...")
+        time.sleep(wait_secs)
+    except Exception as e:
+        logger.warning(f"start_tiktok_app failed: {e}")
 
 
 def setup_device(device: str = ADB_DEVICE) -> bool:
@@ -208,10 +272,12 @@ class DirectPdpClient:
         self._process = process
         self._session: frida.core.Session | None = None
         self._script: frida.core.Script | None = None
+        self._captcha_script: frida.core.Script | None = None
         self._lock = threading.Lock()
         self._connect_lock = threading.Lock()
         self._pending: dict[str, threading.Event] = {}
         self._results: dict[str, dict] = {}
+        self.captcha_state = captcha_mod.CaptchaState()
 
     def connect(self) -> None:
         if self._remote:
@@ -233,6 +299,28 @@ class DirectPdpClient:
         print(f"[*] Ping: {status}")
         if "error" in status.lower():
             raise RuntimeError(f"Agent not ready: {status}")
+
+        if CAPTCHA_AGENT_PATH.exists():
+            captcha_code = CAPTCHA_AGENT_PATH.read_text(encoding="utf-8")
+            self._captcha_script = self._session.create_script(captcha_code)
+            self._captcha_script.on("message", self._on_captcha_message)
+            self._captcha_script.load()
+            result = self._captcha_script.exports_sync.install_hooks()
+            print(f"[*] Captcha agent: {result}")
+
+    def _on_captcha_message(self, message: dict, _data: bytes | None) -> None:
+        if message["type"] != "send":
+            return
+        payload = message["payload"]
+        if not isinstance(payload, dict):
+            return
+        msg_type = payload.get("type")
+        if msg_type == "captcha_challenge_raw":
+            self.captcha_state.on_challenge_raw(payload.get("url", ""), payload.get("body", ""))
+        elif msg_type == "captcha_image_url":
+            self.captcha_state.on_image_url(payload.get("url", ""))
+        elif msg_type in ("captcha_log", "captcha_webview", "captcha_verify_raw"):
+            logger.debug("[captcha-agent] %s", payload.get("msg") or payload.get("url", "") or payload.get("body", "")[:120])
 
     def _on_message(self, message: dict, _data: bytes | None) -> None:
         if message["type"] == "send":
@@ -312,27 +400,30 @@ class DirectPdpClient:
 
     def _reconnect(self) -> None:
         with self._connect_lock:
-            try:
-                if self._script:
-                    self._script.unload()
-            except Exception:
-                pass
+            for script in (self._captcha_script, self._script):
+                if script:
+                    try:
+                        script.unload()
+                    except Exception:
+                        pass
             try:
                 if self._session:
                     self._session.detach()
             except Exception:
                 pass
-
             self._script = None
+            self._captcha_script = None
             self._session = None
+            self.captcha_state.clear()
             self.connect()
 
     def close(self) -> None:
-        if self._script:
-            try:
-                self._script.unload()
-            except Exception:
-                pass
+        for script in (self._captcha_script, self._script):
+            if script:
+                try:
+                    script.unload()
+                except Exception:
+                    pass
         if self._session:
             try:
                 self._session.detach()
@@ -517,6 +608,22 @@ def fetch_single_product(
             time.sleep(BG_DROP_WAIT)
             continue
 
+        if CAPSOLVER_API_KEY and (not body or blen <= MIN_RESPONSE_LEN):
+            if captcha_mod.detect_captcha(ADB_DEVICE):
+                logger.warning(
+                    "Captcha detected for %s (attempt %d/%d)",
+                    product_id, attempt, MAX_ATTEMPTS,
+                )
+                solved = captcha_mod.handle_captcha(
+                    client.captcha_state, ADB_DEVICE, CAPSOLVER_API_KEY
+                )
+                if solved:
+                    logger.info("Captcha resolved — retrying %s", product_id)
+                    continue
+                logger.warning("Captcha solve failed — waiting %ds", BG_DROP_WAIT)
+                time.sleep(BG_DROP_WAIT)
+                continue
+
         if _is_not_exist_error(body):
             ne_content = json.dumps({"not_exists": True, "product_id": product_id})
             if gcs_uploader:
@@ -573,6 +680,119 @@ class QueueConsumer:
         self.success_count = 0
         self.failed_count = 0
         self.not_exists_count = 0
+        self.request_count = 0
+        self.next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
+        self._pending_pause = False
+        self.swipe_count = 0
+        self.next_swipe_at = random.randint(SWIPE_MIN_REQUESTS, SWIPE_MAX_REQUESTS)
+
+    def _maybe_swipe(self) -> None:
+        """Swipe down on the screen every SWIPE_MIN_REQUESTS..SWIPE_MAX_REQUESTS calls."""
+        self.swipe_count += 1
+        if self.swipe_count >= self.next_swipe_at:
+            self.logger.info("Swipe down on device (after %d requests)", self.swipe_count)
+            swipe_screen_down(ADB_DEVICE)
+            self.swipe_count = 0
+            self.next_swipe_at = random.randint(SWIPE_MIN_REQUESTS, SWIPE_MAX_REQUESTS)
+
+    def _maybe_burst_pause(self) -> None:
+        """Flag a burst pause; actual sleep happens in start_consuming loop
+        (so we can disconnect first and avoid RabbitMQ consumer_timeout).
+        """
+        self._maybe_swipe()
+        self.request_count += 1
+        if self.request_count >= self.next_pause_at:
+            self._pending_pause = True
+            self.logger.info(
+                "Burst pause threshold reached (%d requests) — stopping consumer",
+                self.request_count,
+            )
+            try:
+                self.channel.stop_consuming()
+            except Exception as e:
+                self.logger.warning("stop_consuming failed: %s", e)
+
+    def _run_burst_pause(self) -> None:
+        """Detach Frida, kill TikTok, disconnect RabbitMQ, sleep 30-35 min,
+        then relaunch TikTok, reattach Frida, and reconnect RabbitMQ."""
+        pause_secs = random.randint(BURST_PAUSE_MIN_SECONDS, BURST_PAUSE_MAX_SECONDS)
+        pause_mins = pause_secs / 60
+        self.logger.info(
+            "Burst pause starting — closing TikTok + disconnecting, sleeping %.1f min (%ds)...",
+            pause_mins, pause_secs,
+        )
+
+        # 1. Detach Frida from TikTok
+        try:
+            self.client.close()
+        except Exception as e:
+            self.logger.warning("client.close failed: %s", e)
+
+        # 2. Force-stop TikTok app
+        stop_tiktok_app(ADB_DEVICE)
+
+        # 3. Disconnect RabbitMQ
+        try:
+            if self.connection and not self.connection.is_closed:
+                self.connection.close()
+        except Exception as e:
+            self.logger.warning("connection.close failed: %s", e)
+        self.connection = None
+        self.channel = None
+
+        # 4. Sleep — periodically wake the screen so the device stays reachable
+        wake_device(ADB_DEVICE)
+        for remaining in range(pause_secs, 0, -1):
+            m, s = divmod(remaining, 60)
+            print(f"\r    Resume in {m}m {s:02d}s...    ", end="", flush=True)
+            time.sleep(1)
+            if SCREEN_WAKE_INTERVAL > 0 and remaining % SCREEN_WAKE_INTERVAL == 0:
+                wake_device(ADB_DEVICE)
+        print()
+
+        self.request_count = 0
+        self.next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
+        self._pending_pause = False
+
+        # 5. Wake screen + relaunch TikTok (longer settle for cold start)
+        wake_device(ADB_DEVICE)
+        time.sleep(1)
+        start_tiktok_app(ADB_DEVICE, wait_secs=10)
+
+        # 6. Reattach Frida, with retry for transient TransportError / ProcessNotFound
+        self._reattach_frida_with_retry(max_attempts=5)
+
+        # 7. Reconnect RabbitMQ
+        self.logger.info("Reconnecting to RabbitMQ; next burst pause after %d more requests", self.next_pause_at)
+        self.connect()
+
+    def _reattach_frida_with_retry(self, max_attempts: int = 5) -> None:
+        """Reattach Frida with exponential backoff. Kill+relaunch TikTok on persistent failure."""
+        for attempt in range(1, max_attempts + 1):
+            self.logger.info("Reattaching Frida to TikTok (attempt %d/%d)...", attempt, max_attempts)
+            try:
+                self.client.connect()
+                self.logger.info("Frida reattached successfully")
+                return
+            except Exception as e:
+                self.logger.warning("Frida reattach attempt %d failed: %s", attempt, e)
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+                if attempt == max_attempts:
+                    raise
+                # Every 2 attempts, kill+relaunch TikTok to force a clean state
+                if attempt % 2 == 0:
+                    self.logger.info("Restarting TikTok before next reattach...")
+                    stop_tiktok_app(ADB_DEVICE)
+                    time.sleep(2)
+                    wake_device(ADB_DEVICE)
+                    start_tiktok_app(ADB_DEVICE, wait_secs=10)
+                else:
+                    backoff = 5 * attempt
+                    self.logger.info("Waiting %ds before retry...", backoff)
+                    time.sleep(backoff)
 
     def _upload_failed_payload(
         self,
@@ -629,6 +849,7 @@ class QueueConsumer:
         """Process a single message from the queue."""
         task = None
         content = None
+        api_called = False
         try:
             task = json.loads(body.decode("utf-8"))
             product_id = task.get("product_id")
@@ -650,6 +871,7 @@ class QueueConsumer:
                 gcs_date=gcs_date,
                 gcs_context=context,
             )
+            api_called = True
             
             if status == "success":
                 self.success_count += 1
@@ -678,7 +900,9 @@ class QueueConsumer:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
             else:
                 raise RuntimeError(f"PDP fetch failed for {product_id}")
-                
+
+            self._maybe_burst_pause()
+
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
             retry_attempt = int(task.get("retry_attempt", 0)) if task else 0
@@ -713,22 +937,39 @@ class QueueConsumer:
                 )
                 ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
                 self.logger.error(f"FAILED after {MAX_RETRY} retries, rejected")
+
+            if api_called:
+                self._maybe_burst_pause()
     
     def start_consuming(self) -> None:
-        """Start consuming messages from the queue."""
-        self.logger.info("Starting to consume messages...")
-        self.channel.basic_consume(
-            queue=QUEUE_NAME,
-            on_message_callback=self._handle_message
-        )
+        """Consume messages, pausing+reconnecting when burst threshold is hit."""
         try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            self.logger.info("Interrupted, stopping...")
-            self.channel.stop_consuming()
+            while True:
+                self._pending_pause = False
+                self.logger.info("Starting to consume messages...")
+                self.channel.basic_consume(
+                    queue=QUEUE_NAME,
+                    on_message_callback=self._handle_message,
+                )
+                try:
+                    self.channel.start_consuming()
+                except KeyboardInterrupt:
+                    self.logger.info("Interrupted, stopping...")
+                    try:
+                        self.channel.stop_consuming()
+                    except Exception:
+                        pass
+                    break
+
+                if not self._pending_pause:
+                    break
+                self._run_burst_pause()
         finally:
             if self.connection and not self.connection.is_closed:
-                self.connection.close()
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
             self.logger.info(f"Done. Success: {self.success_count}, Not exists: {self.not_exists_count}, Failed: {self.failed_count}")
 
 
@@ -796,6 +1037,8 @@ def run_csv_mode(args) -> None:
 
     success = failed = not_exists = 0
     target_success = args.limit if args.limit else total
+    request_count = 0
+    next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
     try:
         client.connect()
         print(f"[*] {len(products)} products to check, output -> {output_dir}\n")
@@ -831,6 +1074,21 @@ def run_csv_mode(args) -> None:
                     print(f"\r    Waiting {remaining}s...", end="", flush=True)
                     time.sleep(1)
                 print()
+
+            if result != "skip":
+                request_count += 1
+                if request_count >= next_pause_at:
+                    pause_secs = random.randint(BURST_PAUSE_MIN_SECONDS, BURST_PAUSE_MAX_SECONDS)
+                    pause_mins = pause_secs / 60
+                    print(f"\n[*] Burst pause after {request_count} requests — sleeping {pause_mins:.1f} min ({pause_secs}s)...")
+                    for remaining in range(pause_secs, 0, -1):
+                        m, s = divmod(remaining, 60)
+                        print(f"\r    Resume in {m}m {s:02d}s...    ", end="", flush=True)
+                        time.sleep(1)
+                    print()
+                    request_count = 0
+                    next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
+                    print(f"[*] Next burst pause after {next_pause_at} more requests\n")
 
     except KeyboardInterrupt:
         print("\n\n[!] Interrupted")
