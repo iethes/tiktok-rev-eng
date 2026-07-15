@@ -11,6 +11,8 @@ python magpie-direct.py --csv input/tiktok_rio.csv --limit 10
 
 Duplicate `product_id` rows are skipped once the matching `output/<product_id>.json` exists, so `Success` counts unique fetched products, not input rows.
 
+CSV mode uses the same burst-pause device behavior as queue mode: after `BURST_PAUSE_MIN_REQUESTS..BURST_PAUSE_MAX_REQUESTS` non-skipped requests, it detaches Frida, force-stops TikTok, sleeps `BURST_PAUSE_MIN_SECONDS..BURST_PAUSE_MAX_SECONDS` while waking the device periodically, relaunches TikTok, and reattaches Frida before continuing.
+
 
 ## Setup Progress
 

@@ -676,6 +676,69 @@ def fetch_single_product(
     return "failed", body
 
 
+def sleep_with_device_wake(pause_secs: int) -> None:
+    """Sleep while periodically waking the device so ADB stays reachable."""
+    wake_device(ADB_DEVICE)
+    for remaining in range(pause_secs, 0, -1):
+        m, s = divmod(remaining, 60)
+        print(f"\r    Resume in {m}m {s:02d}s...    ", end="", flush=True)
+        time.sleep(1)
+        if SCREEN_WAKE_INTERVAL > 0 and remaining % SCREEN_WAKE_INTERVAL == 0:
+            wake_device(ADB_DEVICE)
+    print()
+
+
+def reattach_frida_with_retry(client: DirectPdpClient, log: logging.Logger = logger, max_attempts: int = 5) -> None:
+    """Reattach Frida with exponential backoff. Kill+relaunch TikTok on persistent failure."""
+    for attempt in range(1, max_attempts + 1):
+        log.info("Reattaching Frida to TikTok (attempt %d/%d)...", attempt, max_attempts)
+        try:
+            client.connect()
+            log.info("Frida reattached successfully")
+            return
+        except Exception as e:
+            log.warning("Frida reattach attempt %d failed: %s", attempt, e)
+            try:
+                client.close()
+            except Exception:
+                pass
+            if attempt == max_attempts:
+                raise
+            if attempt % 2 == 0:
+                log.info("Restarting TikTok before next reattach...")
+                stop_tiktok_app(ADB_DEVICE)
+                time.sleep(2)
+                wake_device(ADB_DEVICE)
+                start_tiktok_app(ADB_DEVICE, wait_secs=10)
+            else:
+                backoff = 5 * attempt
+                log.info("Waiting %ds before retry...", backoff)
+                time.sleep(backoff)
+
+
+def run_csv_burst_pause(client: DirectPdpClient, request_count: int) -> int:
+    """Queue-mode-style burst pause for CSV mode. Returns next pause threshold."""
+    pause_secs = random.randint(BURST_PAUSE_MIN_SECONDS, BURST_PAUSE_MAX_SECONDS)
+    pause_mins = pause_secs / 60
+    print(
+        f"\n[*] Burst pause after {request_count} requests — "
+        f"closing TikTok + sleeping {pause_mins:.1f} min ({pause_secs}s)..."
+    )
+    try:
+        client.close()
+    except Exception as e:
+        logger.warning("client.close failed: %s", e)
+    stop_tiktok_app(ADB_DEVICE)
+    sleep_with_device_wake(pause_secs)
+    wake_device(ADB_DEVICE)
+    time.sleep(1)
+    start_tiktok_app(ADB_DEVICE, wait_secs=10)
+    reattach_frida_with_retry(client, logger, max_attempts=5)
+    next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
+    print(f"[*] Next burst pause after {next_pause_at} more requests\n")
+    return next_pause_at
+
+
 class QueueConsumer:
     """RabbitMQ queue consumer for TikTok PDP tasks."""
     
@@ -749,14 +812,7 @@ class QueueConsumer:
         self.channel = None
 
         # 4. Sleep — periodically wake the screen so the device stays reachable
-        wake_device(ADB_DEVICE)
-        for remaining in range(pause_secs, 0, -1):
-            m, s = divmod(remaining, 60)
-            print(f"\r    Resume in {m}m {s:02d}s...    ", end="", flush=True)
-            time.sleep(1)
-            if SCREEN_WAKE_INTERVAL > 0 and remaining % SCREEN_WAKE_INTERVAL == 0:
-                wake_device(ADB_DEVICE)
-        print()
+        sleep_with_device_wake(pause_secs)
 
         self.request_count = 0
         self.next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
@@ -775,32 +831,7 @@ class QueueConsumer:
         self.connect()
 
     def _reattach_frida_with_retry(self, max_attempts: int = 5) -> None:
-        """Reattach Frida with exponential backoff. Kill+relaunch TikTok on persistent failure."""
-        for attempt in range(1, max_attempts + 1):
-            self.logger.info("Reattaching Frida to TikTok (attempt %d/%d)...", attempt, max_attempts)
-            try:
-                self.client.connect()
-                self.logger.info("Frida reattached successfully")
-                return
-            except Exception as e:
-                self.logger.warning("Frida reattach attempt %d failed: %s", attempt, e)
-                try:
-                    self.client.close()
-                except Exception:
-                    pass
-                if attempt == max_attempts:
-                    raise
-                # Every 2 attempts, kill+relaunch TikTok to force a clean state
-                if attempt % 2 == 0:
-                    self.logger.info("Restarting TikTok before next reattach...")
-                    stop_tiktok_app(ADB_DEVICE)
-                    time.sleep(2)
-                    wake_device(ADB_DEVICE)
-                    start_tiktok_app(ADB_DEVICE, wait_secs=10)
-                else:
-                    backoff = 5 * attempt
-                    self.logger.info("Waiting %ds before retry...", backoff)
-                    time.sleep(backoff)
+        reattach_frida_with_retry(self.client, self.logger, max_attempts)
 
     def _upload_failed_payload(
         self,
@@ -1088,17 +1119,8 @@ def run_csv_mode(args) -> None:
             if result != "skip":
                 request_count += 1
                 if request_count >= next_pause_at:
-                    pause_secs = random.randint(BURST_PAUSE_MIN_SECONDS, BURST_PAUSE_MAX_SECONDS)
-                    pause_mins = pause_secs / 60
-                    print(f"\n[*] Burst pause after {request_count} requests — sleeping {pause_mins:.1f} min ({pause_secs}s)...")
-                    for remaining in range(pause_secs, 0, -1):
-                        m, s = divmod(remaining, 60)
-                        print(f"\r    Resume in {m}m {s:02d}s...    ", end="", flush=True)
-                        time.sleep(1)
-                    print()
+                    next_pause_at = run_csv_burst_pause(client, request_count)
                     request_count = 0
-                    next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
-                    print(f"[*] Next burst pause after {next_pause_at} more requests\n")
 
     except KeyboardInterrupt:
         print("\n\n[!] Interrupted")
