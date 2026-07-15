@@ -535,10 +535,10 @@ def fetch_one(
         print(f"  [{attempt}/{MAX_ATTEMPTS}] {blen:,} bytes", end="")
 
         if _is_background_drop(body):
-            print(f"\n  [!] App went background — bring TikTok to foreground! Waiting {BG_DROP_WAIT}s...", end="")
-            time.sleep(BG_DROP_WAIT)
+            print("\n  [!] App went background — restarting TikTok/Frida...", end="")
+            restart_tiktok_session(client, "app went background")
             if attempt < MAX_ATTEMPTS:
-                print(f"  retrying...", end="")
+                print("  retrying...", end="")
             continue
 
         if _is_not_exist_error(body):
@@ -612,8 +612,8 @@ def fetch_single_product(
         logger.info(f"Product {product_id} attempt {attempt}/{MAX_ATTEMPTS}: {blen:,} bytes")
 
         if _is_background_drop(body):
-            logger.warning(f"App went background, waiting {BG_DROP_WAIT}s...")
-            time.sleep(BG_DROP_WAIT)
+            logger.warning("App went background — restarting TikTok/Frida...")
+            restart_tiktok_session(client, "app went background")
             continue
 
         if CAPSOLVER_API_KEY and (not body or blen <= MIN_RESPONSE_LEN):
@@ -714,6 +714,21 @@ def reattach_frida_with_retry(client: DirectPdpClient, log: logging.Logger = log
                 backoff = 5 * attempt
                 log.info("Waiting %ds before retry...", backoff)
                 time.sleep(backoff)
+
+
+def restart_tiktok_session(client: DirectPdpClient, reason: str = "") -> None:
+    """Restart TikTok and reattach Frida after the app/session gets poisoned."""
+    if reason:
+        logger.info("Restarting TikTok session: %s", reason)
+    try:
+        client.close()
+    except Exception as e:
+        logger.warning("client.close failed: %s", e)
+    stop_tiktok_app(ADB_DEVICE)
+    wake_device(ADB_DEVICE)
+    time.sleep(1)
+    start_tiktok_app(ADB_DEVICE, wait_secs=10)
+    reattach_frida_with_retry(client, logger, max_attempts=5)
 
 
 def run_csv_burst_pause(client: DirectPdpClient, request_count: int) -> int:

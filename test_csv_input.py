@@ -19,6 +19,36 @@ def test_default_csv_prefers_input_folder():
         assert magpie_direct.default_csv_path(root) == csv_path
 
 
+def test_fetch_one_recovers_when_app_goes_background():
+    calls = []
+
+    class Client:
+        bodies = iter([
+            '{"message":"drop background requests"}',
+            '{"ok":true,"data":"' + ('x' * 10020) + '"}',
+        ])
+        def call_pdp(self, _product_id):
+            return next(self.bodies)
+
+    old = magpie_direct.restart_tiktok_session
+    try:
+        magpie_direct.restart_tiktok_session = lambda _client, reason="": calls.append(reason)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "out"
+            ne = out / "not_exists"
+            out.mkdir(); ne.mkdir()
+            assert magpie_direct.fetch_one(
+                0, 1, "173",
+                output_dir=out,
+                not_exists_dir=ne,
+                client=Client(),
+                delay=0,
+            ) == "success"
+        assert calls == ["app went background"]
+    finally:
+        magpie_direct.restart_tiktok_session = old
+
+
 def test_csv_burst_pause_closes_app_and_reattaches():
     calls = []
 
@@ -53,5 +83,6 @@ def test_csv_burst_pause_closes_app_and_reattaches():
 
 if __name__ == "__main__":
     test_default_csv_prefers_input_folder()
+    test_fetch_one_recovers_when_app_goes_background()
     test_csv_burst_pause_closes_app_and_reattaches()
     print("ok")

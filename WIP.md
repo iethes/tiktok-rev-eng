@@ -13,6 +13,8 @@ Duplicate `product_id` rows are skipped once the matching `output/<product_id>.j
 
 CSV mode uses the same burst-pause device behavior as queue mode: after `BURST_PAUSE_MIN_REQUESTS..BURST_PAUSE_MAX_REQUESTS` non-skipped requests, it detaches Frida, force-stops TikTok, sleeps `BURST_PAUSE_MIN_SECONDS..BURST_PAUSE_MAX_SECONDS` while waking the device periodically, relaunches TikTok, and reattaches Frida before continuing.
 
+If TikTok returns `drop background requests`, the script now immediately restarts TikTok and reattaches Frida before retrying; this prevents the follow-up 46-byte `internal error` loop.
+
 
 ## Setup Progress
 
