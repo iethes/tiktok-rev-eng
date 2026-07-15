@@ -432,9 +432,17 @@ class DirectPdpClient:
         print("[*] Detached")
 
 
+def default_csv_path(base_dir: Path = SCRIPT_DIR) -> Path:
+    input_csvs = sorted((base_dir / "input").glob("*.csv"))
+    return input_csvs[0] if input_csvs else base_dir / "products_tiktok.csv"
+
+
 def load_products(csv_path: Path) -> list[dict]:
-    with open(csv_path, newline="") as f:
-        return list(csv.DictReader(f))[::-1]
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if rows and "product_id" not in rows[0]:
+        raise ValueError(f"{csv_path} must have a product_id column")
+    return [row for row in rows[::-1] if row.get("product_id")]
 
 
 BG_DROP_WAIT = 15
@@ -1015,7 +1023,8 @@ def run_queue_mode(args) -> None:
 
 def run_csv_mode(args) -> None:
     """Run in CSV processing mode."""
-    products = load_products(CSV_PATH)
+    csv_path = args.csv or default_csv_path()
+    products = load_products(csv_path)
     if args.offset:
         products = products[args.offset:]
 
@@ -1041,6 +1050,7 @@ def run_csv_mode(args) -> None:
     next_pause_at = random.randint(BURST_PAUSE_MIN_REQUESTS, BURST_PAUSE_MAX_REQUESTS)
     try:
         client.connect()
+        print(f"[*] CSV: {csv_path}")
         print(f"[*] {len(products)} products to check, output -> {output_dir}\n")
 
         for i, row in enumerate(products):
@@ -1108,6 +1118,7 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--delay", type=float, default=DEFAULT_DELAY)
+    p.add_argument("--csv", type=Path, default=None, help="Input CSV (default: input/*.csv, then products_tiktok.csv)")
     p.add_argument("--output", default="output")
     p.add_argument("-H", "--remote", default=DEFAULT_REMOTE)
     p.add_argument("--usb", action="store_true")

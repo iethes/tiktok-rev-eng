@@ -1,5 +1,17 @@
 # TikTok RPC Hijack - Session Summary
 
+## CSV Input
+
+`magpie-direct.py` now prefers the first `input/*.csv` file when running CSV mode. The CSV only needs a `product_id` column; extra columns are ignored.
+
+```bash
+python magpie-direct.py --csv input/tiktok_rio.csv --limit 10
+# or omit --csv to auto-pick input/*.csv
+```
+
+Duplicate `product_id` rows are skipped once the matching `output/<product_id>.json` exists, so `Success` counts unique fetched products, not input rows.
+
+
 ## Setup Progress
 
 ### Environment
