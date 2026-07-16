@@ -1,1 +1,11 @@
 /output/*
+
+.env
+gcs-service-account.json
+
+__pycache__/
+/.venv/
+/venv/
+
+*.log
+frida-server-*
